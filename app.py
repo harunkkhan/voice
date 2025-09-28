@@ -26,9 +26,13 @@ SAMPLE_RATE = 24000
 CHANNELS = 1
 DTYPE = "int16"
 
-# Create one output stream for the app lifetime
-speaker = sd.OutputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE, blocksize=0)
-speaker.start()
+ENABLE_LOCAL_PLAYBACK = os.getenv("ENABLE_LOCAL_PLAYBACK", "true").lower() in ("1", "true", "yes")
+
+# Create one output stream for the app lifetime if enabled
+speaker: sd.OutputStream | None = None
+if ENABLE_LOCAL_PLAYBACK:
+    speaker = sd.OutputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE, blocksize=0)
+    speaker.start()
 
 
 def _build_instructions() -> str:
@@ -37,7 +41,7 @@ def _build_instructions() -> str:
     Honors OPENAI_SYSTEM_PROMPT if provided; otherwise constructs a translation-only prompt
     targeting OPENAI_TRANSLATE_TO (default: English).
     """
-    explicit = "You are a bilingual translator. Strictly translate all input speech and text between English and Chinese. If the input is English, output Chinese (Mandarin, Simplified). If the input is Chinese, output natural, idiomatic English. Do not add prefaces, commentary, or explanations. Preserve meaning, tone, names, numbers, punctuation, and formatting. If proper nouns have a well-known translation, use it. If the input mixes both languages, translate each segment into the other language so the output is fully in one language."
+    explicit = "You are a bilingual translator. Strictly translate all input speech and text between English and Korean. If the input is English, output Korean. If the input is Korean, output natural, idiomatic English. Do not add prefaces, commentary, or explanations. Preserve meaning, tone, names, numbers, punctuation, and formatting. If proper nouns have a well-known translation, use it. If the input mixes both languages, translate each segment into the other language so the output is fully in one language."
 
     if explicit:
         return explicit
@@ -179,8 +183,68 @@ class OAIClient:
             self._thread.join(timeout=1.0)
 
 
-async def _oai_receiver(oai_client: OAIClient, speaking_event: asyncio.Event | None = None):
-    """Receive audio deltas from OpenAI and play them on the local speaker."""
+class TwilioMediaStreamSender:
+    """Convert OpenAI 24 kHz PCM to 8 kHz μ-law and stream back to Twilio."""
+
+    FRAME_SAMPLES = 160  # 20 ms of audio at 8 kHz
+
+    def __init__(self, ws: WebSocket, stream_sid: str):
+        self.ws = ws
+        self.stream_sid = stream_sid
+        self._rate_state = None
+        self._buffer = bytearray()
+        self._closed = False
+
+    async def send_pcm24(self, pcm24: bytes):
+        if self._closed or not pcm24:
+            return
+        pcm8k, self._rate_state = audioop.ratecv(pcm24, 2, 1, 24000, 8000, self._rate_state)
+        if pcm8k:
+            self._buffer.extend(pcm8k)
+            await self._flush_full_frames()
+
+    async def flush(self, pad: bool = False):
+        if self._closed:
+            self._buffer.clear()
+            return
+        frame_bytes = self.FRAME_SAMPLES * 2
+        if pad and self._buffer:
+            remainder = len(self._buffer) % frame_bytes
+            if remainder:
+                self._buffer.extend(b"\x00" * (frame_bytes - remainder))
+        await self._flush_full_frames()
+        self._buffer.clear()
+
+    def mark_closed(self):
+        self._closed = True
+        self._buffer.clear()
+
+    async def _flush_full_frames(self):
+        frame_bytes = self.FRAME_SAMPLES * 2
+        while len(self._buffer) >= frame_bytes and not self._closed:
+            frame = bytes(self._buffer[:frame_bytes])
+            del self._buffer[:frame_bytes]
+            mulaw = audioop.lin2ulaw(frame, 2)
+            payload = base64.b64encode(mulaw).decode()
+            message = {
+                "event": "media",
+                "streamSid": self.stream_sid,
+                "media": {"payload": payload},
+            }
+            try:
+                await self.ws.send_text(json.dumps(message))
+            except Exception as exc:
+                self._closed = True
+                print(f"Error sending Twilio media frame: {exc}")
+                break
+
+
+async def _oai_receiver(
+    oai_client: OAIClient,
+    speaking_event: asyncio.Event | None = None,
+    twilio_sender: TwilioMediaStreamSender | None = None,
+):
+    """Receive audio from OpenAI, optionally play locally, and stream back to Twilio."""
     frames = 0
     conversation_state = {
         "user_speaking": False,
@@ -189,12 +253,24 @@ async def _oai_receiver(oai_client: OAIClient, speaking_event: asyncio.Event | N
         "session_ready": False
     }
 
+    async def handle_assistant_audio(pcm24: bytes):
+        nonlocal frames
+        if not pcm24:
+            return
+        if ENABLE_LOCAL_PLAYBACK and speaker is not None:
+            samples = np.frombuffer(pcm24, dtype=np.int16)
+            speaker.write(samples)
+        if twilio_sender is not None:
+            await twilio_sender.send_pcm24(pcm24)
+        frames += 1
+        if OPENAI_WS_DEBUG and frames % 20 == 0:
+            print(f"[OAI] handled audio frames: {frames}")
+
     while True:
         msg = await oai_client.recv_q.get()
         if isinstance(msg, bytes):
-            # If raw bytes are delivered, assume PCM16 at 24000 Hz and play
-            samples = np.frombuffer(msg, dtype=np.int16)
-            speaker.write(samples)
+            # If raw bytes are delivered, assume PCM16 at 24000 Hz
+            await handle_assistant_audio(msg)
             continue
 
         try:
@@ -255,14 +331,10 @@ async def _oai_receiver(oai_client: OAIClient, speaking_event: asyncio.Event | N
             if audio_b64:
                 try:
                     pcm24 = base64.b64decode(audio_b64)
-                    samples = np.frombuffer(pcm24, dtype=np.int16)
-                    speaker.write(samples)
+                    await handle_assistant_audio(pcm24)
                     conversation_state["assistant_speaking"] = True
                     if speaking_event is not None:
                         speaking_event.set()
-                    frames += 1
-                    if OPENAI_WS_DEBUG and frames % 20 == 0:
-                        print(f"[OAI] played audio frames: {frames}")
                 except Exception as e:
                     if OPENAI_WS_DEBUG:
                         print(f"[OAI] Error decoding audio: {e}")
@@ -271,6 +343,8 @@ async def _oai_receiver(oai_client: OAIClient, speaking_event: asyncio.Event | N
             conversation_state["assistant_speaking"] = False
             if speaking_event is not None:
                 speaking_event.clear()
+            if twilio_sender is not None:
+                await twilio_sender.flush(pad=True)
             if OPENAI_WS_DEBUG:
                 print("[OAI] Audio generation completed")
 
@@ -341,6 +415,7 @@ async def audio_ws(ws: WebSocket):
     oai_send_task: asyncio.Task | None = None
     pcm16_queue: asyncio.Queue[bytes] = asyncio.Queue()
     speaking = asyncio.Event()  # True while OpenAI is speaking
+    twilio_sender: TwilioMediaStreamSender | None = None
 
     stream_sid = None
     instructions = _build_instructions()
@@ -400,11 +475,28 @@ async def audio_ws(ws: WebSocket):
                     )
                     if OPENAI_WS_DEBUG:
                         print("[OAI] >> session.update (server VAD, voice, formats)")
+                    oai_client.send_json(
+                        {
+                            "type": "conversation.item.create",
+                            "item": {
+                                "type": "message",
+                                "role": "system",
+                                "content": [
+                                    {"type": "input_text", "text": instructions}
+                                ],
+                            },
+                        }
+                    )
+                    if OPENAI_WS_DEBUG:
+                        print("[OAI] >> conversation.item.create (system instructions)")
                 except Exception as e:
                     print(f"session.update failed: {e}")
 
+                if stream_sid:
+                    twilio_sender = TwilioMediaStreamSender(ws, stream_sid)
+
                 # Start receiver to play OpenAI audio locally and track speaking state
-                oai_recv_task = asyncio.create_task(_oai_receiver(oai_client, speaking))
+                oai_recv_task = asyncio.create_task(_oai_receiver(oai_client, speaking, twilio_sender))
                 # Start sender to forward Twilio audio to OpenAI
                 oai_send_task = asyncio.create_task(_oai_sender(oai_client, pcm16_queue))
 
@@ -433,6 +525,12 @@ async def audio_ws(ws: WebSocket):
 
             elif event == "stop":
                 print("Stream stopped")
+                if twilio_sender is not None:
+                    try:
+                        await twilio_sender.flush(pad=True)
+                    except Exception as exc:
+                        if OPENAI_WS_DEBUG:
+                            print(f"[Twilio] flush on stop failed: {exc}")
                 break
 
     except WebSocketDisconnect:
@@ -453,5 +551,11 @@ async def audio_ws(ws: WebSocket):
                 oai_client.close()
         except Exception:
             pass
+        if twilio_sender is not None:
+            try:
+                await twilio_sender.flush(pad=False)
+            except Exception:
+                pass
+            twilio_sender.mark_closed()
         # Keep speaker open for reuse; if you want, stop/close here.
         pass
