@@ -462,7 +462,12 @@ async def audio_ws(ws: WebSocket):
                                 "audio": {
                                     "input": {
                                         "format": {"type": "audio/pcm", "rate": 24000},
-                                        "turn_detection": {"type": "semantic_vad"}
+                                        "turn_detection": {
+                                            "type": "server_vad",
+                                            "threshold": 0.6,
+                                            "prefix_padding_ms": 400,
+                                            "silence_duration_ms": 900
+                                        }
                                     },
                                     "output": {
                                         "format": {"type": "audio/pcm"},
